@@ -2,7 +2,7 @@
 
 Recovers deleted files from USB flash drives, SD/microSD cards, external drives and internal hard drives/SSDs. It supports NTFS (Windows drives), exFAT, FAT32, FAT16, and the ext4 and btrfs filesystems used by NAS boxes. It can also rebuild RAID arrays. FlashRescue only reads from the drive and never writes to it.
 
-**Version 1.7.0**
+**Version 1.8.0**
 
 ## Install and update
 
@@ -12,7 +12,22 @@ Download **FlashRescue-Setup-x.y.z.exe** from the [releases page](https://github
 
 **ffmpeg** (for checking and repairing videos) isn't in the installer. The first time it's needed, FlashRescue offers to download it from gyan.dev (about 100 MB, checked against its published checksum) and keeps it for next time.
 
+## Portable USB (recovering on someone else's PC)
+
+Click **Portable USB...** (bottom right), pick the stick and press **Make portable copy**. That puts FlashRescue in `<stick>:\FlashRescue`, with ffmpeg if you tick it. On any 64-bit Windows 10/11 PC, run `FlashRescue.exe` from the stick. It asks for administrator rights, and nothing gets installed.
+
+- **What stays on the stick:** settings, temp files (previews, checks, the scanner helper process) and ffmpeg. The program runs from its folder, so nothing is unpacked onto the PC. What no program can avoid is Windows itself noting that a program ran (Prefetch and a few registry entries).
+- **A file called `portable.txt` turns this on.** Delete it to make the copy an ordinary one. You can also download **FlashRescue-Portable-x.y.z.zip** from the releases page and unzip it onto a stick.
+- **Update checks are off on a stick,** so it doesn't contact GitHub from a client's PC. **Check for updates** still works when you click it, and **Download and update this copy** replaces the program files on the stick, keeping Data, tools and portable.txt.
+- **Recovering from the PC's own Windows drive?** Windows keeps writing to it while it runs. The best option is to shut the PC down and move the drive to another PC (a USB dock or adapter). Next best is to boot the PC from a WinPE rescue stick (for example Hiren's BootCD PE) and run FlashRescue from there. FlashRescue warns you if you try to scan the drive Windows is running from, or the stick it's running from.
+- **Save to a different drive,** ideally a fast external drive. Most sticks are slow for big rescue images.
+
 ## What's new
+
+### Portable USB (1.8.0)
+- **Portable USB...** makes a copy of FlashRescue that runs from a stick and writes nothing to the PC it runs on (settings, temp files and ffmpeg stay on the stick).
+- Portable copies update themselves in place. Each release also comes as a portable zip.
+- Clearer warnings when scanning the drive Windows is running from, or the stick FlashRescue runs from.
 
 ### In-app updates and an installer (1.7.0)
 - FlashRescue now has an installer, Start menu and desktop shortcuts, and its own icon.

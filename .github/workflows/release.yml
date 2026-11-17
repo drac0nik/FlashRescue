@@ -20,9 +20,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -61,6 +61,25 @@ jobs:
           if (Test-Path $out) { Get-Content $out }
           if ($p.ExitCode -ne 0) { throw "the built app's self-test failed (exit code $($p.ExitCode))" }
 
+      - name: Make the portable version and self-test it in portable mode
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          New-Item -ItemType Directory -Force stage | Out-Null
+          Copy-Item -Recurse dist\FlashRescue stage\FlashRescue
+          python -c "import sys; sys.path.insert(0, 'src'); import portable; open(r'stage\FlashRescue\portable.txt', 'w', encoding='utf-8').write(portable.MARKER_TEXT)"
+          $before = Test-Path "$env:APPDATA\FlashRescue"
+          $out = "$env:RUNNER_TEMP\selftest_portable.txt"
+          $p = Start-Process "stage\FlashRescue\FlashRescue.exe" -ArgumentList "--selftest", "`"$out`"" -Wait -PassThru
+          if (Test-Path $out) { Get-Content $out }
+          if ($p.ExitCode -ne 0) { throw "the portable self-test failed (exit code $($p.ExitCode))" }
+          if (-not $before -and (Test-Path "$env:APPDATA\FlashRescue")) { throw "portable mode wrote to %APPDATA%" }
+          if (-not (Test-Path "stage\FlashRescue\Data\temp")) { throw "portable mode didn't use its own temp folder" }
+          Remove-Item -Recurse -Force stage\FlashRescue\Data
+          python -c "import shutil; shutil.make_archive(r'dist\FlashRescue-Portable-$v', 'zip', 'stage', 'FlashRescue')"
+          $h = (Get-FileHash "dist\FlashRescue-Portable-$v.zip" -Algorithm SHA256).Hash.ToLower()
+          "$h  FlashRescue-Portable-$v.zip" | Out-File -Encoding ascii "dist\FlashRescue-Portable-$v.zip.sha256"
+
       - name: Build the installer
         shell: pwsh
         run: |
@@ -93,4 +112,5 @@ jobs:
         run: |
           $v = "${{ steps.ver.outputs.version }}"
           gh release create "v$v" "dist\FlashRescue-Setup-$v.exe" "dist\FlashRescue-Setup-$v.exe.sha256" `
+            "dist\FlashRescue-Portable-$v.zip" "dist\FlashRescue-Portable-$v.zip.sha256" `
             --title "FlashRescue $v" --notes-file notes.md --target $env:GITHUB_SHA

@@ -27,6 +27,7 @@ import media
 import raid
 import worker
 import updater
+import portable
 from engine import human_size
 
 try:
@@ -36,7 +37,7 @@ except Exception:
     HAVE_PIL = False
 
 APP = 'FlashRescue'
-VERSION = '1.7.0'
+VERSION = '1.8.0'
 IS_WIN = os.name == 'nt'
 
 IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tif', 'tiff', 'ico', 'cr2', 'nef', 'arw', 'dng', 'pef'}
@@ -84,8 +85,7 @@ def drive_letter_of(path):
 
 
 def _settings_path():
-    base = os.environ.get('APPDATA') or os.path.expanduser('~')
-    return os.path.join(base, 'FlashRescue', 'settings.json')
+    return os.path.join(portable.data_dir(), 'settings.json')      # on the stick in portable mode
 
 
 def load_settings():
@@ -141,8 +141,7 @@ def set_window_icon(win):
 
 
 def _last_scan_path():
-    base = os.environ.get('APPDATA') or os.path.expanduser('~')
-    d = os.path.join(base, 'FlashRescue')
+    d = portable.data_dir()
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, 'Last scan.frscan')
 
@@ -185,7 +184,9 @@ class App:
         self.saver = None
         self.settings = load_settings()
 
-        root.title(f'{APP} {VERSION} - recover deleted files')
+        root.title(f'{APP} {VERSION} - recover deleted files' +
+                   ((f'  (portable, running from {portable.stick_letter()}:)' if portable.stick_letter()
+                     else '  (portable)') if portable.is_portable() else ''))
         root.geometry('1280x800')
         root.minsize(980, 560)
         self._build()
@@ -193,6 +194,9 @@ class App:
         self._update_info = None
         self.refresh_drives()
         root.after(4000, self.start_update_check)
+        if portable.is_portable():
+            self.status_var.set(f'Portable mode: settings and temp files stay in {portable.app_dir()} - nothing is '
+                                'written to this PC. Save recovered files to a drive that is not being scanned.')
         root.protocol('WM_DELETE_WINDOW', self.on_close)
         root.after(120, self.poll)
 
@@ -289,6 +293,7 @@ class App:
                         else ('Helvetica', 9, 'bold'))
         self.update_btn = ttk.Button(line, text='Check for updates', command=self.update_clicked)
         self.update_btn.pack(side='right', padx=(10, 0))
+        ttk.Button(line, text='Portable USB...', command=lambda: PortableDialog(self)).pack(side='right', padx=(10, 0))
         self.auto_var = tk.StringVar(value='')
         ttk.Label(line, textvariable=self.auto_var, foreground='#1b6e20').pack(side='right')
 
@@ -498,12 +503,22 @@ class App:
             return
         if d.get('system'):
             what = 'This disk holds Windows' if d.get('kind') == 'disk' else 'This is your Windows drive'
-            if not messagebox.askyesno(APP, f'{what}.\n\n'
-                    'Windows and your programs write to it constantly, which can overwrite deleted files at '
-                    'any moment. For the best chance:\n'
+            best = ('The safest way is not to run this Windows at all: shut the PC down and connect the drive to '
+                    'another PC (a USB dock or adapter), or boot this PC from a rescue stick (WinPE) and run '
+                    'FlashRescue from there.\n\nIf you go ahead here:\n') if portable.is_portable() else \
+                'For the best chance:\n'
+            if not messagebox.askyesno(APP, f'{what}, and Windows is running from it right now.\n\n'
+                    'Windows and its programs write to it constantly, which can overwrite deleted files at '
+                    f'any moment. {best}'
                     '  - close other programs and avoid downloading or installing anything\n'
                     '  - save recovered files to a different drive (a USB stick or external drive)\n\n'
                     'Scan it now?', icon='warning'):
+                return
+        if portable.is_portable() and portable.stick_letter() and portable.stick_letter() in d.get('letters', set()):
+            if not messagebox.askyesno(APP, 'FlashRescue is running from this drive, and keeps its settings and temp '
+                                            'files on it while it runs - which could overwrite deleted files here.'
+                                            '\n\nTo recover from this stick, run FlashRescue from somewhere else. '
+                                            'Scan it anyway?', icon='warning'):
                 return
         if d.get('kind') in ('volume', 'disk'):
             rep = self._health_for(d)
@@ -2451,6 +2466,162 @@ class RaidDialog:
         self.top.destroy()
 
 
+class PortableDialog:
+    """Put a portable FlashRescue on a USB stick (or any folder) to take to someone else's PC."""
+
+    def __init__(self, app):
+        self.app = app
+        self.cancel = threading.Event()
+        top = self.top = tk.Toplevel(app.root)
+        top.title(f'{APP} - portable USB')
+        top.geometry('760x500')
+        set_window_icon(top)
+        frm = ttk.Frame(top, padding=12)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, wraplength=720, justify='left', text=(
+            'Makes a copy of FlashRescue that runs from a USB stick without installing. On the PC it runs on, '
+            'it keeps everything it writes for itself (settings, temp files, ffmpeg) on the stick, and nothing is '
+            'unpacked onto that PC. Recovered files and rescue images go wherever you choose - ideally an external '
+            'drive, as most sticks are slow for large images.')).pack(anchor='w')
+        if portable.is_portable():
+            ttk.Label(frm, foreground='#555', wraplength=720, text=(
+                f'This copy is already portable ({portable.app_dir()}). You can still copy it to another stick.')).pack(
+                anchor='w', pady=(6, 0))
+
+        tf = ttk.LabelFrame(frm, text=' Where ', padding=8)
+        tf.pack(fill='x', pady=8)
+        self.sticks = [d for d in app.drives if d.get('kind') == 'volume' and d.get('letter')
+                       and not d.get('system')]
+        self.sticks.sort(key=lambda d: (d.get('type') != 'Removable', d['letter']))
+        names = [f"{d['letter']}:  {d.get('label') or ''}  ({human_size(d.get('size', 0))}"
+                 f"{', USB stick / card' if d.get('type') == 'Removable' else ''})" for d in self.sticks]
+        self.v_target = tk.StringVar()
+        self.cb = ttk.Combobox(tf, values=names, state='readonly', width=60)
+        self.cb.grid(row=0, column=0, sticky='we')
+        self.cb.bind('<<ComboboxSelected>>', self._picked)
+        ttk.Button(tf, text='Other folder...', command=self._browse).grid(row=0, column=1, padx=6)
+        ttk.Label(tf, text='Folder:').grid(row=1, column=0, sticky='w', pady=(6, 0))
+        ttk.Entry(tf, textvariable=self.v_target, width=70).grid(row=2, column=0, columnspan=2, sticky='we')
+        tf.columnconfigure(0, weight=1)
+        if self.sticks:
+            self.cb.current(0)
+            self._picked()
+
+        self.v_ff = tk.BooleanVar(value=True)
+        have = media.find_ffmpeg()[0]
+        ttk.Checkbutton(frm, variable=self.v_ff, text=(
+            'Include ffmpeg (video checking and repair work offline)' + ('' if have else
+                                                                         ' - downloaded from gyan.dev, about 100 MB'))).pack(anchor='w')
+        self.how = ('copy' if portable.is_folder_build() else 'download')
+        ttk.Label(frm, foreground='#555', wraplength=720, text=(
+            'The program files are copied from this installed copy.' if self.how == 'copy' else
+            'This copy can\'t be copied as a portable one (it is a single-file or source version), so the portable '
+            'version of the newest release is downloaded from GitHub and checked against its checksum.')).pack(
+            anchor='w', pady=(6, 0))
+        self.pbar = ttk.Progressbar(frm, mode='determinate', maximum=1000)
+        self.pbar.pack(fill='x', pady=(12, 0))
+        self.msg = tk.StringVar()
+        ttk.Label(frm, textvariable=self.msg, wraplength=720).pack(anchor='w')
+        b = ttk.Frame(frm)
+        b.pack(fill='x', side='bottom')
+        self.btn = ttk.Button(b, text='Make portable copy', style='Big.TButton', command=self.go)
+        self.btn.pack(side='right')
+        ttk.Button(b, text='Close', command=self.close).pack(side='right', padx=6)
+        top.protocol('WM_DELETE_WINDOW', self.close)
+
+    def _picked(self, _e=None):
+        i = self.cb.current()
+        if i >= 0:
+            self.v_target.set(f"{self.sticks[i]['letter']}:\\FlashRescue")
+
+    def _browse(self):
+        p = filedialog.askdirectory(parent=self.top, title='Folder for the portable FlashRescue')
+        if p:
+            self.v_target.set(os.path.join(os.path.normpath(p), 'FlashRescue'))
+
+    def close(self):
+        self.cancel.set()
+        self.top.destroy()
+
+    def _ui(self, fn, *a):
+        self.app.q.put(('call', lambda: self.top.winfo_exists() and fn(*a)))
+
+    def go(self):
+        target = self.v_target.get().strip()
+        if not target:
+            messagebox.showinfo(APP, 'Choose a USB stick or folder first.', parent=self.top)
+            return
+        target = os.path.abspath(target)
+        if os.path.normcase(target) == os.path.normcase(portable.app_dir()):
+            messagebox.showinfo(APP, 'That is where this copy is running from - pick another place.', parent=self.top)
+            return
+        drv = drive_letter_of(target)
+        if drv and drv == portable.host_windows_letter() and not messagebox.askyesno(
+                APP, f'{drv}: is this PC\'s Windows drive, not a USB stick. Make the portable copy there anyway?',
+                parent=self.top):
+            return
+        try:
+            os.makedirs(target, exist_ok=True)
+            free = shutil.disk_usage(target).free
+        except OSError as ex:
+            messagebox.showerror(APP, f'Cannot use {target}:\n{ex}', parent=self.top)
+            return
+        need = (200 if self.v_ff.get() else 60) * 1024 * 1024
+        if free < need:
+            messagebox.showerror(APP, f'Not enough free space there ({human_size(free)} free, about '
+                                      f'{human_size(need)} needed).', parent=self.top)
+            return
+        self.btn.configure(state='disabled')
+        want_ff = self.v_ff.get()
+        settings = dict(self.app.settings)
+
+        def prog(label):
+            return lambda d, t: self._ui(self._show, label, d, t)
+
+        def work():
+            try:
+                tools = media.find_ffmpeg() if want_ff else None
+                if self.how == 'copy':
+                    portable.copy_app(target, tools if tools and tools[0] else None,
+                                      prog('Copying FlashRescue'), settings)
+                else:
+                    self._ui(self.msg.set, 'Looking up the newest release...')
+                    info = updater.latest(settings)
+                    if not info or not info.get('portable'):
+                        raise RuntimeError('the newest release on GitHub has no portable version to download')
+                    z = updater.download(info['portable'], prog(f"Downloading FlashRescue {info['version']}"),
+                                         self.cancel.is_set)
+                    if not z:
+                        return
+                    portable.extract_zip(z, target, prog('Unpacking'))
+                    os.remove(z)
+                    portable.finish_stick(target, settings)
+                    if tools and tools[0]:
+                        os.makedirs(os.path.join(target, 'tools'), exist_ok=True)
+                        for t in tools:
+                            shutil.copyfile(t, os.path.join(target, 'tools', os.path.basename(t)))
+                if want_ff and not (tools and tools[0]):
+                    updater.download_ffmpeg(prog('Downloading ffmpeg'), self.cancel.is_set,
+                                            out_dir=os.path.join(target, 'tools'))
+                self._ui(self._done, target, None)
+            except Exception as ex:
+                self._ui(self._done, target, ex)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show(self, label, d, t):
+        self.pbar['value'] = 1000 * d / t if t else 0
+        self.msg.set(f'{label}... {d / 1e6:.0f} / {t / 1e6:.0f} MB')
+
+    def _done(self, target, err):
+        self.btn.configure(state='normal')
+        if err:
+            self.msg.set(f'Failed: {err}')
+            return
+        self.pbar['value'] = 1000
+        self.msg.set(f'Ready: {os.path.join(target, "FlashRescue.exe")}  - run it from the stick on any Windows 10/11 '
+                     'PC (it asks for administrator rights).')
+
+
 class UpdatesInfo:
     """'You have the newest version' + the automatic-check setting."""
 
@@ -2498,8 +2669,14 @@ class UpdateDialog:
         txt.configure(state='disabled')
         txt.pack(fill='both', expand=True)
         self.installed, self.built = updater.is_installed(), updater.is_built()
+        self.portable = portable.is_portable() and portable.is_folder_build() and bool(info.get('portable'))
         extra = ''
-        if self.built:
+        if self.portable:
+            extra = (f'This is a portable copy ({portable.app_dir()}). The update replaces the program files here; '
+                     'Data, tools and portable.txt stay as they are. FlashRescue closes and starts again.')
+        elif portable.is_portable():
+            extra = 'This portable copy can\'t update itself, so the download page opens instead.'
+        elif self.built:
             extra = ('This copy was built with Setup.bat. The update installs FlashRescue in its usual place '
                      '(your settings stay as they are) with Start menu and desktop shortcuts - later updates then '
                      'install by themselves.')
@@ -2513,9 +2690,10 @@ class UpdateDialog:
         ttk.Label(frm, textvariable=self.msg).pack(anchor='w')
         b = ttk.Frame(frm)
         b.pack(fill='x', pady=(6, 0))
+        self.can_install = self.portable or ((self.installed or self.built) and not portable.is_portable())
         self.btn_go = ttk.Button(b, style='Big.TButton', command=self.go,
-                                 text='Download and install' if (self.installed or self.built)
-                                 else 'Open the download page')
+                                 text=('Download and update this copy' if self.portable else
+                                       'Download and install') if self.can_install else 'Open the download page')
         self.btn_go.pack(side='right')
         ttk.Button(b, text='Later', command=self.close).pack(side='right', padx=6)
         top.protocol('WM_DELETE_WINDOW', self.close)
@@ -2525,7 +2703,7 @@ class UpdateDialog:
         self.top.destroy()
 
     def go(self):
-        if not (self.installed or self.built):
+        if not self.can_install:
             open_with_default_app(self.info['page'])
             self.close()
             return
@@ -2537,7 +2715,22 @@ class UpdateDialog:
 
         def work():
             try:
-                path, err = updater.download(self.info, progress, self.cancel.is_set), None
+                if self.portable:
+                    new_dir = os.path.join(portable.app_dir(), '_update_new')
+                    shutil.rmtree(new_dir, ignore_errors=True)
+                    z = updater.download(self.info['portable'], progress, self.cancel.is_set,
+                                         dest_dir=portable.temp_dir())
+                    path = None
+                    if z:
+                        self.app.q.put(('call', self.msg.set, 'Unpacking...'))
+                        portable.extract_zip(z, new_dir)
+                        os.remove(z)
+                        if not os.path.isfile(os.path.join(new_dir, 'FlashRescue.exe')):
+                            raise RuntimeError('the portable download has no FlashRescue.exe')
+                        path = new_dir
+                else:
+                    path = updater.download(self.info, progress, self.cancel.is_set)
+                err = None
             except Exception as ex:
                 path, err = None, ex
             self.app.q.put(('call', self._downloaded, path, err))
@@ -2569,7 +2762,13 @@ class UpdateDialog:
                                         'Install now?', parent=self.top):
             self.btn_go.configure(state='normal')
             return
-        updater.run_installer(path)
+        if self.portable:
+            import subprocess
+            script = portable.swap_script(path, os.getpid())
+            subprocess.Popen(['cmd', '/c', script], creationflags=0x00000008 | 0x00000200 | 0x08000000,
+                             close_fds=True)
+        else:
+            updater.run_installer(path)
         self.app.root.destroy()
 
 
@@ -2600,6 +2799,14 @@ def selftest(out_path):
         lines.append(f'icon bundled: {os.path.exists(resource_path("icon.ico"))}')
         src.close()
         code = 0 if ok and os.path.exists(resource_path('icon.ico')) else 2
+        if portable.is_portable():
+            here = os.path.normcase(portable.app_dir())
+            inside = all(os.path.normcase(os.path.abspath(p)).startswith(here) for p in
+                         (tempfile.gettempdir(), d, _settings_path(), _last_scan_path(), updater.ffmpeg_dir()))
+            lines.append(f'portable: temp={tempfile.gettempdir()} settings={_settings_path()} '
+                         f'ffmpeg={updater.ffmpeg_dir()} -> all on the stick: {inside}')
+            if not inside:
+                code = 3
     except Exception as ex:
         import traceback
         lines.append(traceback.format_exc())
@@ -2609,6 +2816,7 @@ def selftest(out_path):
 
 
 def main():
+    portable.setup()                      # portable: settings/temp on the stick, before anything else
     if len(sys.argv) > 2 and sys.argv[1] == '--selftest':
         sys.exit(selftest(sys.argv[2]))
     if IS_WIN:

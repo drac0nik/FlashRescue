@@ -2,7 +2,7 @@
 released, and if so shows an "Update to x.y.z" button. One click downloads the installer,
 checks it against the checksum published with it, and runs it; the installer closes
 FlashRescue, replaces the program and starts it again. Settings live in a separate folder
-(%APPDATA%\\FlashRescue) and aren't touched.
+(%APPDATA%\\FlashRescue, or the Data folder of a portable copy) and aren't touched.
 
 What is sent: an ordinary request for the project's latest-release page on GitHub, with the
 user agent "FlashRescue-updater". Nothing about you, your drives or your files.
@@ -22,6 +22,7 @@ UPDATE_REPO = "drac0nik/FlashRescue"
 CHECK_EVERY = 24 * 3600
 API = os.environ.get("FLASHRESCUE_UPDATE_API") or "https://api.github.com/repos/{repo}/releases/latest"
 INSTALLER_RE = re.compile(r"^FlashRescue-Setup-(\d+\.\d+\.\d+)\.exe$", re.I)
+PORTABLE_RE = re.compile(r"^FlashRescue-Portable-(\d+\.\d+\.\d+)\.zip$", re.I)
 UA = {"User-Agent": "FlashRescue-updater", "Accept": "application/vnd.github+json"}
 
 
@@ -62,28 +63,34 @@ def latest(settings=None, timeout=20):
     data = json.loads(_get(API.format(repo=rp), timeout))
     if data.get("draft") or data.get("prerelease"):
         return None
-    inst = sha_asset = None
-    for a in data.get("assets", []):
-        name = a.get("name", "")
-        if INSTALLER_RE.match(name):
-            inst = a
-        elif name.lower().endswith(".sha256"):
-            sha_asset = a
+    assets = {a.get("name", ""): a for a in data.get("assets", [])}
+    inst = next((a for n, a in assets.items() if INSTALLER_RE.match(n)), None)
+    port = next((a for n, a in assets.items() if PORTABLE_RE.match(n)), None)
     if not inst:
         return None
-    digest = inst.get("digest") or ""          # GitHub publishes "sha256:..." for each asset
-    sha = digest.split(":", 1)[1].lower() if digest.lower().startswith("sha256:") else None
-    if not sha and sha_asset:
-        try:
-            text = _get(sha_asset["browser_download_url"], timeout).decode("utf-8", "replace")
-            m = re.search(r"\b([0-9a-f]{64})\b", text, re.I)
-            sha = m.group(1).lower() if m else None
-        except Exception:
-            sha = None
-    return {"version": INSTALLER_RE.match(inst["name"]).group(1), "notes": data.get("body") or "",
+
+    def sha_of(a):
+        digest = a.get("digest") or ""          # GitHub publishes "sha256:..." for each asset
+        if digest.lower().startswith("sha256:"):
+            return digest.split(":", 1)[1].lower()
+        side = assets.get(a["name"] + ".sha256")
+        if side:
+            try:
+                text = _get(side["browser_download_url"], timeout).decode("utf-8", "replace")
+                m = re.search(r"\b([0-9a-f]{64})\b", text, re.I)
+                return m.group(1).lower() if m else None
+            except Exception:
+                return None
+        return None
+
+    info = {"version": INSTALLER_RE.match(inst["name"]).group(1), "notes": data.get("body") or "",
             "page": data.get("html_url") or f"https://github.com/{rp}/releases/latest",
-            "installer": inst["browser_download_url"], "size": int(inst.get("size") or 0), "sha256": sha,
-            "name": inst["name"]}
+            "installer": inst["browser_download_url"], "size": int(inst.get("size") or 0), "sha256": sha_of(inst),
+            "name": inst["name"], "portable": None}
+    if port:
+        info["portable"] = {"installer": port["browser_download_url"], "size": int(port.get("size") or 0),
+                            "sha256": sha_of(port), "name": port["name"], "version": info["version"]}
+    return info
 
 
 def due(settings):
@@ -101,12 +108,12 @@ def newer(settings, current):
     return None
 
 
-def download(info, progress=lambda done, total: None, cancelled=lambda: False):
+def download(info, progress=lambda done, total: None, cancelled=lambda: False, dest_dir=None):
     """The installer, downloaded to the temp folder and checked. Returns its path, or None if
     cancelled. Raises if the download is incomplete or doesn't match its checksum."""
     if not info.get("sha256"):
         raise RuntimeError("the release has no checksum to check the installer against")
-    dest = os.path.join(tempfile.gettempdir(), info["name"])
+    dest = os.path.join(dest_dir or tempfile.gettempdir(), info["name"])
     part = dest + ".part"
     h = hashlib.sha256()
     req = urllib.request.Request(info["installer"], headers={"User-Agent": UA["User-Agent"]})
@@ -151,11 +158,11 @@ FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
 
 def ffmpeg_dir():
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    return os.path.join(base, "FlashRescue", "tools")
+    import portable
+    return portable.tools_dir()
 
 
-def download_ffmpeg(progress=lambda done, total: None, cancelled=lambda: False):
+def download_ffmpeg(progress=lambda done, total: None, cancelled=lambda: False, out_dir=None):
     """Download gyan.dev's ffmpeg build, check it against the checksum gyan.dev publishes next to
     it, and put ffmpeg.exe + ffprobe.exe in %LOCALAPPDATA%\\FlashRescue\\tools. Returns that folder."""
     import zipfile
@@ -164,7 +171,7 @@ def download_ffmpeg(progress=lambda done, total: None, cancelled=lambda: False):
     if not m:
         raise RuntimeError("gyan.dev didn't give a checksum for the ffmpeg download")
     want = m.group(1).lower()
-    out = ffmpeg_dir()
+    out = out_dir or ffmpeg_dir()
     os.makedirs(out, exist_ok=True)
     part = os.path.join(out, "ffmpeg.zip.part")
     h = hashlib.sha256()

@@ -25,7 +25,9 @@ Each new version
    (or GitHub Desktop: Repository > Create tag, then Push.)
 3. GitHub builds it on Windows (Actions tab: about 10 minutes): builds FlashRescue, runs its
    self-test (the scanner helper process must find a test file), makes
-   FlashRescue-Setup-1.7.1.exe and publishes it as a release with its checksum. Every
+   FlashRescue-Setup-1.7.1.exe and FlashRescue-Portable-1.7.1.zip (the portable copy is
+   self-tested too: it must keep everything inside its own folder), and publishes them as a
+   release with their checksums. Every
    FlashRescue sees "Update to 1.7.1" within a day (or at once with "Check for updates").
 
 Notes
@@ -43,5 +45,8 @@ Notes
   against the checksum published with the release before they're run.
 - A copy built with Setup.bat updates too: the update installs the regular version (and its
   shortcuts) alongside, and from then on updates install by themselves.
+- Pushing a tag didn't work from Claude's session (the connection dropped), so 1.7.0 was
+  released with "Run workflow" on the Actions tab instead (it reads the version from
+  src/FlashRescue.py and creates the tag itself). Pushing a tag from your PC works too.
 - To build an installer on your own PC instead: install Inno Setup 6
   (https://jrsoftware.org/isinfo.php), run Setup.bat once, then installer\build_installer.bat.
