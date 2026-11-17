@@ -1,0 +1,96 @@
+# Builds the Windows installer and publishes it as a GitHub release, which FlashRescue's
+# "Update to x.y.z" button picks up.
+#
+# To release a version: set VERSION in src/FlashRescue.py (e.g. '1.7.1'), add its section to
+# README.md ("### What changed (1.7.1)"), commit, then push a tag with the same number:
+#     git tag v1.7.1 && git push origin v1.7.1
+# (or run this workflow by hand from the Actions tab: it reads the version from src/FlashRescue.py).
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path src\FlashRescue.py -Pattern "VERSION = '([^']+)'").Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and "v$v" -ne $env:GITHUB_REF_NAME) {
+            throw "The tag $env:GITHUB_REF_NAME doesn't match VERSION $v in src/FlashRescue.py"
+          }
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "VERSION must look like 1.7.0 (got $v)" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pillow pyinstaller
+
+      - name: Check the source compiles
+        run: python -m compileall -q src
+
+      - name: Build FlashRescue
+        run: >
+          python -m PyInstaller --noconfirm --clean --log-level WARN --onedir --windowed --uac-admin
+          --name FlashRescue --icon src\icon.ico
+          --add-data "src\icon.ico;." --add-data "src\icon.png;."
+          --paths src --hidden-import linuxfs
+          --distpath dist --workpath build src\FlashRescue.py
+
+      - name: Self-test the built app (scanner helper process, icon)
+        shell: pwsh
+        run: |
+          $out = "$env:RUNNER_TEMP\selftest.txt"
+          $p = Start-Process "dist\FlashRescue\FlashRescue.exe" -ArgumentList "--selftest", "`"$out`"" -Wait -PassThru
+          if (Test-Path $out) { Get-Content $out }
+          if ($p.ExitCode -ne 0) { throw "the built app's self-test failed (exit code $($p.ExitCode))" }
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y | Out-Null
+          $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          & $iscc /Q "/DAppVersion=${{ steps.ver.outputs.version }}" "/DSourceDir=..\dist\FlashRescue" installer\FlashRescue.iss
+          $exe = "dist\FlashRescue-Setup-${{ steps.ver.outputs.version }}.exe"
+          if (-not (Test-Path $exe)) { throw "installer not built" }
+          $h = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$h  FlashRescue-Setup-${{ steps.ver.outputs.version }}.exe" | Out-File -Encoding ascii "$exe.sha256"
+
+      - name: Release notes from the README
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $lines = Get-Content README.md
+          $out = @(); $on = $false
+          foreach ($l in $lines) {
+            if ($l -match "\($([regex]::Escape($v))\)\s*$") { $on = $true; continue }
+            if ($on -and ($l -match '\(\d+\.\d+(\.\d+)?\)\s*$' -or $l -match '^## ')) { break }
+            if ($on) { $out += $l }
+          }
+          if (-not ($out -join '').Trim()) { $out = @("FlashRescue $v") }
+          $out | Out-File -Encoding utf8 notes.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          gh release create "v$v" "dist\FlashRescue-Setup-$v.exe" "dist\FlashRescue-Setup-$v.exe.sha256" `
+            --title "FlashRescue $v" --notes-file notes.md --target $env:GITHUB_SHA

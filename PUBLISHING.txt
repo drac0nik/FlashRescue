@@ -1,0 +1,47 @@
+Publishing FlashRescue with an installer and in-app updates
+============================================================
+
+One-time setup
+1. The GitHub repository is drac0nik/FlashRescue (public). FlashRescue already looks there
+   for updates (UPDATE_REPO in src/updater.py).
+2. Put this folder in it (everything here, including the hidden .github folder - the
+   .gitignore keeps .build, dist, tools and FlashRescue.exe out). Either:
+   - GitHub Desktop: File > Add local repository > this folder > Publish, or
+   - command line, in this folder:
+       git init -b main
+       git add .
+       git commit -m "FlashRescue"
+       git remote add origin https://github.com/drac0nik/FlashRescue.git
+       git push -u origin main
+
+Each new version
+1. Set VERSION in src/FlashRescue.py (e.g. '1.7.1' - always three numbers) and add its
+   section to README.md under "What's new", as a heading ending in the version in brackets,
+   e.g. "### Faster deep scan (1.7.1)". The lines under that heading become the release
+   notes people see in the "Update available" window.
+2. Commit and push, then tag it with the same number and push the tag:
+       git tag v1.7.1
+       git push origin v1.7.1
+   (or GitHub Desktop: Repository > Create tag, then Push.)
+3. GitHub builds it on Windows (Actions tab: about 10 minutes): builds FlashRescue, runs its
+   self-test (the scanner helper process must find a test file), makes
+   FlashRescue-Setup-1.7.1.exe and publishes it as a release with its checksum. Every
+   FlashRescue sees "Update to 1.7.1" within a day (or at once with "Check for updates").
+
+Notes
+- The installer needs no administrator rights: it installs for the current user in
+  %LOCALAPPDATA%\Programs\FlashRescue, with Start menu and desktop shortcuts. FlashRescue
+  itself still asks for administrator rights when it starts (it reads drives directly).
+- Settings stay in %APPDATA%\FlashRescue, and ffmpeg (downloaded the first time a video is
+  checked or repaired) in %LOCALAPPDATA%\FlashRescue\tools. Installing, updating and
+  uninstalling never touch them.
+- ffmpeg is deliberately not inside the installer: it is GPL-licensed, and downloading it
+  from gyan.dev on first use (checked against gyan.dev's published checksum) avoids
+  redistributing it from this repository.
+- The installer isn't code-signed, so Windows SmartScreen shows "Windows protected your
+  PC" the first time: More info > Run anyway. Updates from inside FlashRescue are checked
+  against the checksum published with the release before they're run.
+- A copy built with Setup.bat updates too: the update installs the regular version (and its
+  shortcuts) alongside, and from then on updates install by themselves.
+- To build an installer on your own PC instead: install Inno Setup 6
+  (https://jrsoftware.org/isinfo.php), run Setup.bat once, then installer\build_installer.bat.
