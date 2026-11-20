@@ -24,9 +24,7 @@ def _child(spec, opts, out_q, cancel_ev, id_base):
     import engine
     engine.FoundFile._next_id = id_base
     try:
-        src = engine.RawSource(spec['path'], spec.get('label'))
-        if spec.get('map'):
-            src.load_rescue_map(spec['map'])
+        src = open_spec(spec)
     except Exception as ex:
         out_q.put(('error', f'{type(ex).__name__}: {ex}', traceback.format_exc()))
         return
@@ -79,6 +77,45 @@ def _child(spec, opts, out_q, cancel_ev, id_base):
         src.close()
 
 
+def portable_spec(src):
+    """A description the helper process can open the same source from, or None (then the scan
+    stays on a thread). Plain drives and images go by path; an unlocked encrypted volume goes as
+    its (already derived) volume key plus where its data sits - never the password."""
+    import images
+    import encrypted
+    if isinstance(src, encrypted.DecryptedSource):
+        parent = portable_spec(src.parent)
+        if not parent:
+            return None
+        c = src.cipher
+        return {'unlock': {'parent': parent, 'data_offset': src.data_offset, 'size': src.size,
+                           'mode': ('xts-' if c.kind == 'xts' else 'cbc-' if c.kind == 'cbc' else 'ecb') +
+                           ('' if c.kind == 'ecb' else c.iv), 'key': c.key.hex(), 'unit': c.unit,
+                           'iv_shift': c.iv_shift, 'unit_base': src.unit_base, 'label': src.label,
+                           'kind': src.kind},
+                'path': src.path, 'label': src.label}
+    if type(src).__name__ in ('VirtualRaid', 'LvSource', 'SubSource'):
+        return None
+    return {'path': src.path, 'label': src.label, 'map': src.map_path, 'image': isinstance(src, images._ImageBase)}
+
+
+def open_spec(spec):
+    import engine
+    import images
+    if 'unlock' in spec:
+        import encrypted
+        u = spec['unlock']
+        parent = open_spec(u['parent'])
+        cip = encrypted.SectorCipher('aes', u['mode'], bytes.fromhex(u['key']), unit=u['unit'], iv_shift=u['iv_shift'])
+        return encrypted.DecryptedSource(parent, u['data_offset'], u['size'], cip, u['label'], u['unit_base'],
+                                         u['kind'])
+    src = (images.open_image(spec['path'], spec.get('label')) if spec.get('image')
+           else engine.RawSource(spec['path'], spec.get('label')))
+    if spec.get('map'):
+        src.load_rescue_map(spec['map'])
+    return src
+
+
 class ProcessScanner:
     """Same interface as engine.Scanner (run(), cancel, callbacks), but the work happens in a
     helper process. `src` is the app's own RawSource: unreadable areas the helper found are
@@ -100,7 +137,9 @@ class ProcessScanner:
 
     def run(self):
         engine = self.engine
-        spec = {'path': self.src.path, 'label': self.src.label, 'map': self.src.map_path}
+        spec = portable_spec(self.src)
+        if spec is None:
+            raise StartFailed('this source can only be scanned inside the app')
         id_base = (engine.FoundFile._next_id // ID_STRIDE + 1) * ID_STRIDE
         q = self.ctx.Queue()
         p = self.ctx.Process(target=_child, args=(spec, self.opts, q, self.cancel, id_base), daemon=True,

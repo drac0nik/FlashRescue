@@ -40,7 +40,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pillow pyinstaller
+          python -m pip install pillow pyinstaller cryptography zstandard argon2-cffi
 
       - name: Check the source compiles
         run: python -m compileall -q src
@@ -50,7 +50,7 @@ jobs:
           python -m PyInstaller --noconfirm --clean --log-level WARN --onedir --windowed --uac-admin
           --name FlashRescue --icon src\icon.ico
           --add-data "src\icon.ico;." --add-data "src\icon.png;."
-          --paths src --hidden-import linuxfs
+          --paths src --hidden-import linuxfs --hidden-import xfs --hidden-import f2fs --hidden-import lzo --hidden-import images --hidden-import encrypted --hidden-import fragments --hidden-import previews --hidden-import search --hidden-import recoverability --hidden-import zstandard --hidden-import argon2 --hidden-import _cffi_backend
           --distpath dist --workpath build src\FlashRescue.py
 
       - name: Self-test the built app (scanner helper process, icon)

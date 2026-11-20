@@ -28,13 +28,13 @@ set "VPY=.build\venv\Scripts\python.exe"
 
 echo  [2/4] Installing Pillow and PyInstaller...
 "%VPY%" -m pip install --upgrade pip --quiet --disable-pip-version-check
-"%VPY%" -m pip install --quiet --disable-pip-version-check pillow pyinstaller || goto fail
+"%VPY%" -m pip install --quiet --disable-pip-version-check pillow pyinstaller cryptography zstandard argon2-cffi || goto fail
 
 echo  [3/4] Building FlashRescue.exe...
 "%VPY%" -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin ^
     --name FlashRescue --icon "%CD%\src\icon.ico" ^
     --add-data "%CD%\src\icon.ico;." --add-data "%CD%\src\icon.png;." ^
-    --paths src --hidden-import linuxfs ^
+    --paths src --hidden-import linuxfs --hidden-import xfs --hidden-import f2fs --hidden-import lzo --hidden-import images --hidden-import encrypted --hidden-import fragments --hidden-import previews --hidden-import search --hidden-import recoverability --hidden-import zstandard --hidden-import argon2 --hidden-import _cffi_backend ^
     --distpath "." --workpath ".build\work" --specpath ".build" ^
     "src\FlashRescue.py" || goto fail
 

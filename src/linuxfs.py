@@ -795,52 +795,95 @@ class BtrfsVolume(engine._VolumeBase):
             names[tid] = '/'.join(reversed(chain))
         return names
 
+    MAX_UNPACK = 1 << 30            # compressed files are unpacked in memory
+
+    @staticmethod
+    def _decompress(comp, data, ram):
+        """btrfs compression: 1 = zlib, 2 = LZO, 3 = zstd."""
+        if comp == 1:
+            return zlib.decompressobj().decompress(data)
+        if comp == 2:
+            import lzo
+            return lzo.btrfs_lzo(data, ram)
+        if comp == 3:
+            import zstandard
+            return zstandard.ZstdDecompressor().decompressobj().decompress(data)
+        raise ValueError('unknown compression')
+
     def _data_runs(self, exts, size):
-        """Device runs from EXTENT_DATA items -> (runs, inline bytes or None, problem or '')."""
-        runs = []
+        """Device runs from EXTENT_DATA items -> (runs, inline bytes or None, problem or '').
+        Files with any compressed part come back as bytes (unpacked); others as runs on the drive."""
+        pieces = []                 # (file offset, ('runs', dev, n) | ('bytes', data))
         pos = 0
-        inline = None
+        compressed = False
         for foff in sorted(exts):
             d = exts[foff]
-            comp, etype = d[16], d[20]
+            ram, comp, etype = u64(d, 8), d[16], d[20]
+            if comp > 3:
+                return None, None, 'Compressed (not supported)'
             if etype == 0:
                 payload = d[21:]
-                if comp == 1:
+                if comp:
+                    compressed = True
                     try:
-                        payload = zlib.decompress(payload)
-                    except zlib.error:
+                        payload = self._decompress(comp, payload, ram)
+                    except Exception:
                         return None, None, 'damaged compressed data'
-                elif comp:
-                    return None, None, 'Compressed (not supported)'
-                inline = (inline or b'') + payload
+                pieces.append((foff, ('bytes', payload[:ram] if ram else payload)))
+                pos = foff + len(payload)
                 continue
             disk, dnum, eoff, nb = u64(d, 21), u64(d, 29), u64(d, 37), u64(d, 45)
-            if foff > pos:
-                runs.append((None, foff - pos))
             if comp:
-                if comp != 1:
-                    return None, None, 'Compressed (not supported)'
+                compressed = True
                 dev = self.to_dev(disk)
                 if dev is None:
                     return None, None, 'data location unknown'
                 try:
-                    raw = zlib.decompressobj().decompress(self.src.read(dev, dnum))
-                except zlib.error:
+                    raw = self._decompress(comp, self.src.read(dev, dnum), ram)
+                except Exception:
                     raw = b''
                 seg = raw[eoff:eoff + nb]
-                inline = (inline or b'') + seg
-                pos = foff + nb
-                continue
-            if disk == 0:
-                runs.append((None, nb))
+                pieces.append((foff, ('bytes', seg.ljust(nb, b'\x00'))))
+            elif disk == 0:
+                pieces.append((foff, ('hole', nb)))
             else:
                 dev = self.to_dev(disk + eoff)
                 if dev is None:
                     return None, None, 'data location unknown'
-                if runs and runs[-1][0] is not None and runs[-1][0] + runs[-1][1] == dev:
-                    runs[-1] = (runs[-1][0], runs[-1][1] + nb)
+                pieces.append((foff, ('runs', dev, nb)))
+            pos = foff + nb
+        if compressed:
+            if size > self.MAX_UNPACK:
+                return None, None, 'Compressed (too large to unpack)'
+            out = bytearray()
+            for foff, p in pieces:
+                if foff > len(out):
+                    out += bytes(foff - len(out))
+                if p[0] == 'bytes':
+                    out[foff:foff + len(p[1])] = p[1]
+                elif p[0] == 'hole':
+                    out[foff:foff + p[1]] = bytes(p[1])
                 else:
-                    runs.append((dev, nb))
+                    out[foff:foff + p[2]] = self.src.read(p[1], p[2]).ljust(p[2], b'\x00')
+            return [], bytes(out[:size]).ljust(size, b'\x00') if size else bytes(out), ''
+        runs = []
+        inline = None
+        pos = 0
+        for foff, p in pieces:
+            if p[0] == 'bytes':
+                inline = (inline or b'') + p[1]
+                continue
+            if foff > pos:
+                runs.append((None, foff - pos))
+            if p[0] == 'hole':
+                runs.append((None, p[1]))
+                pos = foff + p[1]
+                continue
+            dev, nb = p[1], p[2]
+            if runs and runs[-1][0] is not None and runs[-1][0] + runs[-1][1] == dev:
+                runs[-1] = (runs[-1][0], runs[-1][1] + nb)
+            else:
+                runs.append((dev, nb))
             pos = foff + nb
         if inline is not None and not runs:
             return [], inline[:size], ''

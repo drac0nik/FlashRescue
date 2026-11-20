@@ -88,6 +88,119 @@ def _ata_passthrough(f, feature):
     return None
 
 
+def ata_command(f, command, features=0, count=0, lba=0, data_in=False, ext=False):
+    """One ATA command through IOCTL_ATA_PASS_THROUGH. Returns (512-byte data or None, current
+    task-file registers, previous registers) or None if the drive/adapter refused it."""
+    hdr_size = 48 if struct.calcsize('P') == 8 else 40
+    flags = 0x01 | (0x02 if data_in else 0) | (0x08 if ext else 0)
+    cur = bytes([features & 0xFF, count & 0xFF, lba & 0xFF, (lba >> 8) & 0xFF, (lba >> 16) & 0xFF,
+                 0x40 | (0 if ext else (lba >> 24) & 0x0F), command, 0])
+    prev = bytes([features >> 8 & 0xFF, count >> 8 & 0xFF, (lba >> 24) & 0xFF, (lba >> 32) & 0xFF,
+                  (lba >> 40) & 0xFF, 0, 0, 0]) if ext else bytes(8)
+    n = 512 if data_in else 0
+    if hdr_size == 48:
+        hdr = struct.pack('<HHBBBBIII4xQ8s8s', hdr_size, flags, 0, 0, 0, 0, n, 5, 0, hdr_size, prev, cur)
+    else:
+        hdr = struct.pack('<HHBBBBIIII8s8s', hdr_size, flags, 0, 0, 0, 0, n, 5, 0, hdr_size, prev, cur)
+    out = _ioctl(f, IOCTL_ATA_PASS_THROUGH, hdr + bytes(n), hdr_size + n)
+    if not out or len(out) < hdr_size:
+        return None
+    p, c = out[hdr_size - 16:hdr_size - 8], out[hdr_size - 8:hdr_size]
+    if c[6] & 0x01:                                   # status: ERR
+        return None
+    return (out[hdr_size:hdr_size + 512] if data_in else None), c, p
+
+
+def _identify_limits(ident):
+    """(user max sectors, 48-bit?, HPA supported?, DCO supported?) from IDENTIFY DEVICE data."""
+    w = struct.unpack('<256H', ident[:512])
+    lba48 = bool(w[83] & (1 << 10))
+    user = (w[100] | w[101] << 16 | w[102] << 32 | w[103] << 48) if lba48 else (w[60] | w[61] << 16)
+    return user, lba48, bool(w[82] & (1 << 10)), bool(w[83] & (1 << 11))
+
+
+def hidden_areas(n):
+    """Look for a Host Protected Area (HPA) or Device Configuration Overlay (DCO): parts at the end
+    of a hard disk that are hidden from Windows - and from recovery tools - by the drive itself.
+    Returns {'checked', 'hpa_sectors', 'dco_sectors', 'user', 'native', 'dco_max', 'note'}."""
+    rep = {'checked': False, 'hpa_sectors': 0, 'dco_sectors': 0, 'user': None, 'native': None, 'dco_max': None,
+           'note': ''}
+    if os.name != 'nt':
+        rep['note'] = 'only available on Windows'
+        return rep
+    try:
+        f = _open_disk(n)
+    except OSError as ex:
+        rep['note'] = f'could not open the disk ({ex})'
+        return rep
+    with f:
+        try:
+            r = ata_command(f, 0xEC, data_in=True)
+        except Exception:
+            r = None
+        if not r or not r[0]:
+            rep['note'] = ("can't tell - this drive or its USB adapter doesn't pass ATA commands through "
+                           '(NVMe drives have no HPA/DCO)')
+            return rep
+        user, lba48, hpa_ok, dco_ok = _identify_limits(r[0])
+        rep['user'] = user
+        rep['checked'] = True
+        native = None
+        try:
+            if lba48:
+                q = ata_command(f, 0x27, ext=True)
+                if q:
+                    c, p = q[1], q[2]
+                    native = (c[2] | c[3] << 8 | c[4] << 16 | p[2] << 24 | p[3] << 32 | p[4] << 40) + 1
+            else:
+                q = ata_command(f, 0xF8)
+                if q:
+                    c = q[1]
+                    native = (c[2] | c[3] << 8 | c[4] << 16 | (c[5] & 0x0F) << 24) + 1
+        except Exception:
+            native = None
+        rep['native'] = native
+        if native and native > user:
+            rep['hpa_sectors'] = native - user
+        if dco_ok:
+            try:
+                q = ata_command(f, 0xB1, features=0xC2, data_in=True)
+                if q and q[0]:
+                    w = struct.unpack('<256H', q[0])
+                    dmax = (w[3] | w[4] << 16 | w[5] << 32 | w[6] << 48) + 1
+                    rep['dco_max'] = dmax
+                    top = native or user
+                    if dmax > top:
+                        rep['dco_sectors'] = dmax - top
+            except Exception:
+                pass
+    return rep
+
+
+def describe_hidden(rep, sector=512):
+    """One or two plain sentences for the health window."""
+    if not rep.get('checked'):
+        return f"Hidden areas (HPA/DCO): {rep.get('note') or 'not checked'}."
+    out = []
+    if rep['hpa_sectors']:
+        out.append(f"HIDDEN AREA (HPA): the drive hides {engine_size(rep['hpa_sectors'] * sector)} at its end from "
+                   'Windows and from FlashRescue. Old data may be in it (some PC makers put recovery partitions '
+                   'there; it is also a way to hide data). It can be lifted temporarily - until the drive is '
+                   'powered off - with a tool such as HDAT2, or "hdparm -N" on Linux.')
+    if rep['dco_sectors']:
+        out.append(f"HIDDEN AREA (DCO): the drive's configuration hides another "
+                   f"{engine_size(rep['dco_sectors'] * sector)}. Removing a DCO is permanent - leave it to a "
+                   'specialist unless you are sure.')
+    if not out:
+        out.append('Hidden areas (HPA/DCO): none - the whole drive is visible.')
+    return ' '.join(out)
+
+
+def engine_size(n):
+    import engine
+    return engine.human_size(n)
+
+
 def _read_ata(f):
     for getter in (_ata_smart_rcv, _ata_passthrough):
         try:
@@ -250,8 +363,15 @@ def check_disk(n):
         else:
             rep['verdict'] = 'good'
             rep['summary'] = 'No problems reported by the drive.'
-        rep['lines'] = lines
-        return rep
+    try:
+        hid = hidden_areas(n)
+        lines.append(describe_hidden(hid))
+        if hid.get('hpa_sectors') or hid.get('dco_sectors'):
+            rep['summary'] += ' Part of the drive is hidden (see below).'
+    except Exception:
+        pass
+    rep['lines'] = lines
+    return rep
 
 
 def read_temperature(n):

@@ -18,6 +18,7 @@ import os
 import re
 import struct
 import threading
+import time
 import queue
 import zlib
 import array
@@ -1577,6 +1578,8 @@ def _probe_at(src, off, depth=0):
     bs = src.read(off, 512)
     if len(bs) < 512:
         return None, 'Unknown'
+    if bs[:6] == b'LUKS\xba\xbe':
+        return None, 'LUKS encrypted (unlock it with Tools > Unlock encrypted drive)'
     for cls in (ExfatVolume, NtfsVolume, FatVolume):
         if cls.probe(bs):
             try:
@@ -1587,7 +1590,9 @@ def _probe_at(src, off, depth=0):
                 return None, f'{name} (damaged)'
     try:
         import linuxfs
-        for cls in (linuxfs.Ext4Volume, linuxfs.BtrfsVolume):
+        import xfs
+        import f2fs
+        for cls in (linuxfs.Ext4Volume, linuxfs.BtrfsVolume, xfs.XfsVolume, f2fs.F2fsVolume):
             if cls.probe_at(src, off):
                 try:
                     v = cls(src, off)
@@ -2524,13 +2529,15 @@ class Carver:
                         if off in self.known:
                             skip_until = off + self.known[off]
                             continue
-                        res = self._try(off, m.lastindex - 1)
+                        idx = m.lastindex - 1
+                        res = self._try(off, idx)
+                        res = self._fragments(off, idx, res, align)
                         if res:
-                            ln, ext, cond = res
+                            ln, ext, cond, runs = res
                             self.count += 1
                             self.counts[ext] = self.counts.get(ext, 0) + 1
                             item = FoundFile(f'{self.counts[ext]:05d}.{ext}', f'Deep scan/{ext.upper()}', ln,
-                                             [(off, ln)], 'Deep scan', cond)
+                                             runs, 'Deep scan', cond)
                             item.note = f'Found at byte offset {off:,}'
                             if ext in _DATED:
                                 try:
@@ -2539,7 +2546,7 @@ class Carver:
                                 except Exception:
                                     pass
                             self.emit(item)
-                            skip_until = off + ln
+                            skip_until = off + runs[0][1]       # the first piece (a second one lies further on)
                 pf.done_with(pos)
                 done += n
                 self.progress(done / total, done, total)
@@ -2579,6 +2586,44 @@ class Carver:
                     start = off - g * bpg * bsz - (1024 if bsz == 1024 else 0)
                 if start >= 0:
                     self.boot.add_linux(start, 'ext', bytes(data[sb:sb + 1024]))
+
+    FRAG_KINDS = {0: 'jpg', 1: 'png', 4: 'zip', 5: 'mp4'}       # CARVERS index -> type the checker knows
+    VERIFY_MAX = 64 * MB
+    REPAIR_BUDGET = 120.0           # seconds of reassembly per scan; after that files are only checked
+
+    def _fragments(self, off, idx, res, align):
+        """Check a carved file (or one that failed to carve) for being split in two, and put it
+        back together. Returns (length, ext, condition, runs) or None."""
+        kind = self.FRAG_KINDS.get(idx)
+        if res:
+            ln, ext, cond = res
+            runs = [(off, ln)]
+            if kind is None or (kind == 'mp4') or ln > self.VERIFY_MAX:
+                return ln, ext, cond, runs
+        elif kind not in ('png', 'mp4', 'zip', 'jpg'):
+            return None
+        else:
+            ln, ext, cond, runs = None, kind, None, None
+        spent = getattr(self, '_frag_spent', 0.0)
+        t0 = time.time()
+        try:
+            import fragments
+            fr = fragments.check(self.src, off, kind if kind != 'zip' or not res else ext, ln, align,
+                                 window=fragments.WINDOW if spent < self.REPAIR_BUDGET else 0)
+        except Exception:
+            fr = None
+        self._frag_spent = spent + (time.time() - t0)
+        if fr:
+            rel, c2 = fr
+            if c2 == 'Good':
+                return (ln or rel[0][1]), ext, cond or 'Carved (assumes unfragmented)', runs or [(off, rel[0][1])]
+            total = sum(n for _, n in rel)
+            return total, ext, c2, [(off + o, n) for o, n in rel]
+        if res:
+            if kind in ('jpg', 'png'):
+                return ln, ext, 'Damaged or fragmented (could not put it back together)', runs
+            return ln, ext, cond, runs
+        return None
 
     def _try(self, off, idx):
         _, fn, max_size = CARVERS[idx]
@@ -2674,7 +2719,31 @@ class Scanner:
                 return
             emit_now(item)
 
+        def verify_layout(item):
+            """A deleted file whose clusters had to be guessed: check the guess against the data,
+            and try the straight-run layout too."""
+            if item.condition != 'Fragmented (best guess)' or not item.size or item.size > 64 * MB:
+                return
+            ext = (item.ext or '').lower()
+            if ext not in ('jpg', 'jpeg', 'png', 'zip', 'docx', 'xlsx', 'pptx'):
+                return
+            try:
+                import fragments
+                src = self.src
+                data = b''.join(src.read(o, n) if o is not None else bytes(n) for o, n in item.runs)
+                ok = fragments.valid(ext, data)
+                if ok:
+                    item.condition = 'Good (layout checked)'
+                    return
+                straight = src.read(item.start, item.size)
+                if ok is False and fragments.valid(ext, straight):
+                    item.runs = [(item.start, item.size)]
+                    item.condition = 'Good (layout checked)'
+            except Exception:
+                pass
+
         def emit_now(item):
+            verify_layout(item)
             if item.inline is None:
                 item.unreadable = self.src.unreadable_in(item.runs)
             st = item.start

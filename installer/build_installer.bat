@@ -15,7 +15,7 @@ echo Building FlashRescue %VER% (folder version, for the installer)...
 "%VPY%" -m PyInstaller --noconfirm --clean --log-level WARN --onedir --windowed --uac-admin ^
   --name FlashRescue --icon "%CD%\src\icon.ico" ^
   --add-data "%CD%\src\icon.ico;." --add-data "%CD%\src\icon.png;." ^
-  --paths src --hidden-import linuxfs ^
+  --paths src --hidden-import linuxfs --hidden-import xfs --hidden-import f2fs --hidden-import lzo --hidden-import images --hidden-import encrypted --hidden-import fragments --hidden-import previews --hidden-import search --hidden-import recoverability --hidden-import zstandard --hidden-import argon2 --hidden-import _cffi_backend ^
   --distpath dist --workpath .build\work --specpath .build src\FlashRescue.py
 if errorlevel 1 goto :fail
 set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"

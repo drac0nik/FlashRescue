@@ -1,8 +1,8 @@
 # FlashRescue
 
-Recovers deleted files from USB flash drives, SD/microSD cards, external drives and internal hard drives/SSDs. It supports NTFS (Windows drives), exFAT, FAT32, FAT16, and the ext4 and btrfs filesystems used by NAS boxes. It can also rebuild RAID arrays. FlashRescue only reads from the drive and never writes to it.
+Recovers deleted files from USB flash drives, SD/microSD cards, external drives and internal hard drives/SSDs. It supports NTFS (Windows drives), exFAT, FAT32 and FAT16, plus ext2/3/4, btrfs, XFS and F2FS from Linux and NAS boxes. It can also rebuild RAID arrays, open virtual-machine and evidence images, and unlock LUKS and VeraCrypt volumes. FlashRescue only reads from the drive and never writes to it.
 
-**Version 1.8.0**
+**Version 1.9.0**
 
 ## Install and update
 
@@ -23,6 +23,16 @@ Click **Portable USB...** (bottom right), pick the stick and press **Make portab
 - **Save to a different drive,** ideally a fast external drive. Most sticks are slow for big rescue images.
 
 ## What's new
+
+### Recoverability check, more formats, fragmented files, search (1.9.0)
+- **Check chances...** says in seconds whether deleted files are likely to still be there. It checks for an SSD with TRIM, whether deleted files still hold data, and how much old data the free space holds.
+- Opens VHD, VHDX, VMDK, qcow2, VDI and E01 images, and split .001 images.
+- Reads XFS and F2FS, and btrfs files compressed with zstd or LZO.
+- **Tools > Unlock encrypted drive** opens LUKS and VeraCrypt volumes with their password.
+- The drive health check now also reports hidden areas (HPA/DCO).
+- Deep scan puts photos, PNGs, Office files and camera videos that were split in two back together.
+- **Tools > Search inside the data** finds words anywhere on the drive, and can bring back lost text files.
+- Previews now show video frames, document text and camera-raw previews.
 
 ### Portable USB (1.8.0)
 - **Portable USB...** makes a copy of FlashRescue that runs from a stick and writes nothing to the PC it runs on (settings, temp files and ffmpeg stay on the stick).
@@ -139,6 +149,58 @@ On Windows, the drive list also shows **snapshots** such as `C: as it was on 202
 
 H.265/HEVC videos (recent iPhones and many Android phones) need a reference clip if the settings aren't inside the video. Uncompressed (PCM) audio is rebuilt too. Compressed (AAC) audio usually can't be rebuilt without the index, so repaired phone videos may be silent. Repair and video checks need **ffmpeg**, which Setup.bat downloads into the `tools` folder.
 
+### Check chances (recoverability check)
+
+**Check chances...** takes a few seconds and tells you, and the client, whether a long scan is worth it:
+
+- **What the drive is** (Windows): an SSD or a hard disk, whether TRIM is on, and how it's connected. On an SSD with TRIM, Windows tells the drive which blocks were freed, and the drive usually erases them within minutes.
+- **The deleted files themselves:** it reads the file tables and checks whether a sample of deleted files still has its data, or reads as zeros (wiped) or as other data (overwritten). This is the strongest evidence.
+- **The free space:** about 500 small samples show how much old data the unused space still holds.
+
+The verdict is green, amber or red, with the reasons spelled out. When you scan an SSD with TRIM on, FlashRescue offers the check first. On a failing drive, make a rescue image first and check the image instead.
+
+### Disk images
+
+**Open disk image file...** accepts more than raw copies:
+
+| Format | Made by | Supported |
+|---|---|---|
+| VHD | Virtual PC, Hyper-V, Windows backup | fixed, dynamic, differencing |
+| VHDX | Hyper-V, Windows 8+ | dynamic, fixed, differencing |
+| VMDK | VMware | sparse, split, stream-optimized, flat, snapshots |
+| qcow2 | QEMU, KVM, Proxmox | incl. compressed clusters (zlib, zstd) and backing files |
+| VDI | VirtualBox | fixed and dynamic |
+| E01 | EnCase, FTK, ewfacquire | multi-segment (.E01, .E02 ...); areas that couldn't be read when the image was made are flagged |
+| .001 | split raw images | .001, .002 ... joined back together |
+
+A snapshot or differencing disk needs its parent next to it, or at the path it remembers. If the parent can't be found, its parts read as zeros and FlashRescue says so.
+
+### Encrypted drives (Tools > Unlock encrypted drive)
+
+- **LUKS1 and LUKS2** (Linux, many NAS boxes): PBKDF2 or Argon2 key slots, and AES in XTS, CBC-ESSIV or CBC mode. LUKS partitions are found automatically.
+- **VeraCrypt:** AES with SHA-512 or SHA-256 key derivation, custom PIM, normal and hidden volumes. It works on whole drives, partitions and container files.
+
+The unlocked volume is added to the drive list and scanned like a drive. Nothing is written, and the password isn't stored. Not supported: other ciphers (Serpent, Twofish, Camellia, cascades), Whirlpool/Streebog key derivation, VeraCrypt system (boot) encryption, and BitLocker. For BitLocker, unlock the drive in Windows first, then scan its drive letter.
+
+### Hidden areas (HPA / DCO)
+
+**Tools > Drive health** now also asks the drive whether it hides part of itself (a Host Protected Area or a Device Configuration Overlay). Data in a hidden area is invisible to Windows and to every recovery tool. FlashRescue reports how much is hidden, but it doesn't change the drive's settings itself. An HPA can be lifted temporarily, until the drive is powered off, with a tool such as HDAT2. Many USB adapters don't pass the needed commands through, and FlashRescue says so when that happens.
+
+### Search inside the data (Tools > Search inside the data)
+
+- **Finds words or phrases** anywhere on the drive, only in its free space, or only inside the files found. It searches plain text and UTF-16, the encoding Windows and Office use for much of their text. Separate several terms with commas.
+- **Each hit shows** the text around it and the found file it sits in (double-click to select that file).
+- **Lost text files:** text files have no signature, so a deep scan can't find them. For a hit in text that no file claims, **Save the text around it** saves the whole block of text as a file. Lost notes, lists, CSVs and logs come back this way.
+
+### Previews
+
+Besides pictures, the preview panel now shows:
+- **Videos:** a frame and their length, resolution and codec (needs ffmpeg).
+- **Audio:** details and tags.
+- **Documents:** the text of Word, Excel and PowerPoint (new and old formats), OpenDocument, PDF, RTF, email and web pages.
+- **Camera raw files:** the camera's own built-in JPEG preview.
+- **Anything else:** a hex dump plus any readable text inside.
+
 ### More tools
 
 - **Filters:** size range, modified-date range, and **Find duplicates** plus **Hide duplicates**. The best copy of each file stays visible; duplicates are spotted by comparing the start and end of same-sized files.
@@ -211,10 +273,25 @@ Use this for drives from a Synology, QNAP or other NAS, from a RAID card, or fro
 - RAID 5 can rebuild one missing drive. RAID 6 can rebuild any two. Unreadable sectors on a member, including gaps in a rescue image's map, are rebuilt from parity the same way.
 - A single drive from a two-drive Synology mirror (SHR or RAID 1) doesn't need this. Scan it directly.
 
+### Fragmented files
+
+**Deep scan:** a deep scan finds a file by its header. On a well-used card, big photos and videos are often split in two, with another file's data in between. FlashRescue checks each carved file, finds where the data stops making sense, and looks ahead for the piece that continues it:
+
+| Type | How a join is proven |
+|---|---|
+| PNG | every chunk has a checksum |
+| Office files, ZIP | every entry has a checksum, and the central directory gives the gap size directly |
+| JPEG | restart markers, when the camera writes them; otherwise the candidates are decoded and the smoothest picture wins ("best match") |
+| MP4/MOV (camera layout, index at the end) | the gap is where the index really is versus where it should be; each video sample is checked to place the break |
+
+The Condition column says when a file was reassembled, and how sure it is.
+
+**Deleted FAT/exFAT files:** when other data now sits in the middle of a deleted file, FlashRescue guesses its layout by skipping the clusters in use. For photos and Office files, that guess (and the straight layout) is now checked against the data. A layout that checks out shows as "Good (layout checked)".
+
 ### ext4 and btrfs notes (Linux / NAS drives)
 
 - **ext4 / ext3 / ext2:** live files are listed with their real names and folders. When a file is deleted, ext4 wipes its location map, so FlashRescue looks for older copies in the filesystem journal. Recent deletions often come back that way, with full names. If a deleted name is found but no copy of its map is left, the summary counts it, and deep scan is the fallback.
-- **btrfs** (Synology's default): btrfs never overwrites in place, so old versions of its file tree often survive. FlashRescue searches them, and the backup trees, for deleted files with their names. Files that exist only in a snapshot are listed as **Snapshot**. A deep scan also finds orphaned old tree blocks anywhere on the volume. zlib-compressed files are supported; LZO and zstd compressed files aren't.
+- **btrfs** (Synology's default): btrfs never overwrites in place, so old versions of its file tree often survive. FlashRescue searches them, and the backup trees, for deleted files with their names. Files that exist only in a snapshot are listed as **Snapshot**. A deep scan also finds orphaned old tree blocks anywhere on the volume. Compressed files (zlib, LZO and zstd) are unpacked.
 - Lost ext partitions are found even when the main superblock is wiped, using the backup copies.
 
 ## Deep scan file types
@@ -230,9 +307,14 @@ Archives: ZIP, 7Z, APK, JAR
 - On FAT drives, files with short names like `report.pdf` lose their first letter when deleted, so they show up as `_eport.pdf`. Long names are recovered in full.
 - Nothing can recover data that has been overwritten, or a drive that was fully formatted (not quick-formatted).
 - **SSDs:** Windows tells SSDs which space is free (TRIM), and the SSD wipes it, often within minutes. Recovery from an internal SSD usually only works right after deleting. Hard drives, USB sticks and memory cards are much better candidates.
-- ReFS, XFS and Mac filesystems (APFS, HFS+) aren't read directly, but deep scan works on any drive.
+- ReFS, ZFS and Mac filesystems (APFS, HFS+) aren't read directly, but deep scan works on any drive.
+
+### XFS and F2FS notes
+
+- **XFS** (Linux servers, some NAS boxes): live files are listed with their real names. When a file is deleted, XFS clears its location map, so, as with ext4, FlashRescue takes the location from the filesystem log, which keeps recent copies. Deleted names come from leftovers in folders. Recent deletions come back with names; older ones need a deep scan.
+- **F2FS** (some Android phones and memory cards): live files are listed. Deleted files are rebuilt from old copies of their records, which F2FS leaves behind until it cleans up. F2FS records also store their own name and folder. Files encrypted by Android can't be read without the phone's keys.
 - A deep scan of a large hard drive takes a while: about 2 hours per TB at 150 MB/s. Leave **Only search free space** ticked unless the drive was formatted.
-- Plain-text files (`.txt`, `.csv`) have no signature, so deep scan can't find them. The fast scan can.
+- Plain-text files (`.txt`, `.csv`) have no signature, so deep scan can't find them. The fast scan can, and so can **Tools > Search inside the data** (search for a word you know is in the file, then **Save the text around it**).
 
 ## Tip: scan an image instead of the drive
 

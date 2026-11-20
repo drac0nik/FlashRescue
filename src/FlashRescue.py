@@ -28,6 +28,11 @@ import raid
 import worker
 import updater
 import portable
+import images
+import recoverability
+import previews
+import encrypted
+import search
 from engine import human_size
 
 try:
@@ -37,7 +42,7 @@ except Exception:
     HAVE_PIL = False
 
 APP = 'FlashRescue'
-VERSION = '1.8.0'
+VERSION = '1.9.0'
 IS_WIN = os.name == 'nt'
 
 IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tif', 'tiff', 'ico', 'cr2', 'nef', 'arw', 'dng', 'pef'}
@@ -220,12 +225,19 @@ class App:
         ttk.Button(src, text='Refresh', command=self.refresh_drives).grid(row=1, column=0, sticky='w', pady=(6, 0))
         ttk.Button(src, text='Open disk image file...', command=self.pick_image).grid(row=1, column=1, sticky='w',
                                                                                       padx=6, pady=(6, 0))
-        ttk.Button(src, text='Drive health...', command=self.show_health).grid(row=1, column=2, sticky='w',
-                                                                                padx=(0, 6), pady=(6, 0))
+        ttk.Button(src, text='Check chances...', command=self.open_chances).grid(
+            row=1, column=2, sticky='w', padx=(0, 6), pady=(6, 0))
         ttk.Button(src, text='Rescue image (failing drive)...', command=self.open_rescue).grid(
             row=1, column=3, sticky='w', pady=(6, 0))
-        ttk.Button(src, text='Virtual RAID...', command=self.open_raid).grid(
-            row=1, column=4, sticky='w', padx=(6, 0), pady=(6, 0))
+        tools = ttk.Menubutton(src, text='Tools')
+        tm = tk.Menu(tools, tearoff=False)
+        tm.add_command(label='Drive health and hidden areas...', command=self.show_health)
+        tm.add_command(label='Virtual RAID (NAS / RAID drives)...', command=self.open_raid)
+        tm.add_command(label='Unlock encrypted drive (LUKS / VeraCrypt)...', command=self.open_unlock)
+        tm.add_separator()
+        tm.add_command(label='Search inside the data...', command=self.open_search)
+        tools['menu'] = tm
+        tools.grid(row=1, column=4, sticky='w', padx=(6, 0), pady=(6, 0))
         src.columnconfigure(5, weight=1)
 
         # 2. options
@@ -470,7 +482,7 @@ class App:
     def pick_image(self):
         path = filedialog.askopenfilename(
             title='Open a disk image (made with a tool like dd, HDD Raw Copy or Win32 Disk Imager)',
-            filetypes=[('Disk images', '*.img *.dd *.raw *.bin *.iso *.vhd *.001'), ('All files', '*.*')])
+            filetypes=[('Disk images', images.IMAGE_PATTERNS), ('All files', '*.*')])
         if path:
             self.add_image(path)
 
@@ -514,6 +526,8 @@ class App:
                     '  - save recovered files to a different drive (a USB stick or external drive)\n\n'
                     'Scan it now?', icon='warning'):
                 return
+        if not self._ssd_trim_warning(d):
+            return
         if portable.is_portable() and portable.stick_letter() and portable.stick_letter() in d.get('letters', set()):
             if not messagebox.askyesno(APP, 'FlashRescue is running from this drive, and keeps its settings and temp '
                                             'files on it while it runs - which could overwrite deleted files here.'
@@ -556,7 +570,15 @@ class App:
         self.src = None
         self._src_is_virtual = bool(d.get('source_obj'))
         try:
-            self.src = d['source_obj'] if d.get('source_obj') else engine.RawSource(d['path'], d.get('label'))
+            if d.get('source_obj'):
+                self.src = d['source_obj']
+            elif d.get('image'):
+                self.src = images.open_image(d['path'], d.get('label'))      # raw, VHD(X), VMDK, E01, ...
+            else:
+                self.src = engine.RawSource(d['path'], d.get('label'))
+        except images.ImageError as ex:
+            messagebox.showerror(APP, f'Could not read this image file:\n{ex}')
+            return
         except PermissionError:
             messagebox.showerror(APP, 'Windows blocked direct access to the drive.\n\n'
                                       'Close FlashRescue and start it with right-click > "Run as administrator".')
@@ -565,7 +587,9 @@ class App:
             messagebox.showerror(APP, f'Could not open the drive:\n{ex}')
             return
         map_note = ''
-        if d.get('image'):
+        if getattr(self.src, 'kind', 'raw') not in ('raw', 'image') and isinstance(self.src, images._ImageBase):
+            map_note = f' Image type: {self.src.kind}.' + ''.join(f' Note: {n}.' for n in self.src.notes)
+        if d.get('image') and not isinstance(self.src, images._ImageBase):
             mp = rescue.find_map_for_image(d['path'])
             if mp:
                 try:
@@ -602,7 +626,8 @@ class App:
 
         # Plain drives and images are scanned in a helper process (own CPU core, smooth window);
         # assembled RAID / LVM volumes live in this process, so they're scanned on a thread.
-        scanner_cls = engine.Scanner if d.get('source_obj') else worker.ProcessScanner
+        so = d.get('source_obj')
+        scanner_cls = worker.ProcessScanner if (not so or worker.portable_spec(so)) else engine.Scanner
         self.scanner = scanner_cls(
             self.src, opts,
             on_item=on_item,
@@ -993,6 +1018,7 @@ class App:
 
         def work():
             pic = None
+            extra = None
             try:
                 limit = 40 * engine.MB if it.ext in IMAGE_EXTS else 8 * engine.KB
                 data = it.read_head(src, limit)
@@ -1003,8 +1029,15 @@ class App:
                 err = ''
                 if data and it.ext in IMAGE_EXTS and HAVE_PIL:
                     pic = _decode_preview(data, box)
+                if pic is None and token == self.preview_token:
+                    try:                       # video frames, document text, raw-photo previews, strings
+                        pic2, extra = previews.make(it, src, box, media.find_ffmpeg())
+                        if pic2 is not None and HAVE_PIL:
+                            pic = pic2
+                    except Exception as ex:
+                        extra = f'(no preview: {ex})'
             if token == self.preview_token:
-                self.q.put(('preview', token, it, data if pic is None else data[:8 * engine.KB], err, pic))
+                self.q.put(('preview', token, it, data if pic is None else data[:8 * engine.KB], err, pic, extra))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1036,7 +1069,7 @@ class App:
         self.preview_img = None
         self._set_info('')
 
-    def _show_preview(self, token, it, data, err, pic=None):
+    def _show_preview(self, token, it, data, err, pic=None, extra=None):
         if token != self.preview_token:
             return
         info = self._info_text(it)
@@ -1044,6 +1077,11 @@ class App:
             self._set_info(info + f'\n\nCould not read: {err}')
             return
         shown = False
+        if pic is not None and HAVE_PIL and it.ext not in IMAGE_EXTS:
+            self.preview_img = ImageTk.PhotoImage(pic)
+            self.pv_image.configure(image=self.preview_img, text='')
+            self._set_info(info + ('\n\n' + extra if extra else ''))
+            return
         if it.ext in IMAGE_EXTS and HAVE_PIL:
             if isinstance(pic, Image.Image):
                 self.preview_img = ImageTk.PhotoImage(pic)
@@ -1055,12 +1093,11 @@ class App:
         if shown:
             return
         self.pv_image.configure(image='', text='')
-        if it.ext in TEXT_EXTS:
-            txt = data[:4000].decode('utf-8', 'replace')
-            self._set_info(info + '\n\n' + txt)
+        if extra and (it.ext in TEXT_EXTS or not extra.startswith('Readable text inside')):
+            self._set_info(info + '\n\n' + extra)
         else:
-            self._set_info(info + '\n\nFirst bytes:\n' + hexdump(data[:192]) +
-                           '\n\nDouble-click to open it in its normal program.')
+            self._set_info(info + '\n\nFirst bytes:\n' + hexdump(data[:256]) +
+                           ('\n\n' + extra if extra else '') + '\n\nDouble-click to open it in its normal program.')
 
     def open_selected(self):
         its = self._selected_items()
@@ -1348,8 +1385,9 @@ class App:
         info = meta['source']
         src = None
         try:
-            src = engine.RawSource(info['path'], info.get('label'))
-        except OSError:
+            src = (images.open_image(info['path'], info.get('label')) if os.path.isfile(info['path'])
+                   else engine.RawSource(info['path'], info.get('label')))
+        except (OSError, ValueError):
             pass
         if src is None or (info.get('size') and src.size and src.size != info['size']):
             if src:
@@ -1358,13 +1396,13 @@ class App:
                                      'That drive is not available (or has changed size). Plug it back in and try '
                                      'again, or choose the disk image it came from.')
             img = filedialog.askopenfilename(title='Choose the disk image these results came from',
-                                             filetypes=[('Disk images', '*.img *.dd *.raw *.bin *.001'),
+                                             filetypes=[('Disk images', images.IMAGE_PATTERNS),
                                                         ('All files', '*.*')])
             if not img:
                 return
             try:
-                src = engine.RawSource(img)
-            except OSError as ex:
+                src = images.open_image(img)
+            except (OSError, ValueError) as ex:
                 messagebox.showerror(APP, f'Could not open it: {ex}')
                 return
             if info.get('size') and src.size != info['size'] and not messagebox.askyesno(
@@ -1433,6 +1471,65 @@ class App:
             self.rescue_win.top.lift()
             return
         self.rescue_win = RescueWindow(self, d)
+
+    def open_source_for(self, d):
+        """A read-only source for a drive-list entry (drive, disk, image file or virtual volume)."""
+        if d.get('source_obj'):
+            return d['source_obj'], False
+        if d.get('image'):
+            return images.open_image(d['path'], d.get('label')), True
+        return engine.RawSource(d['path'], d.get('label')), True
+
+    def open_unlock(self):
+        d = self._selected_source()
+        if not d:
+            messagebox.showinfo(APP, 'Choose the encrypted drive (or its image file) in the list first.')
+            return
+        UnlockDialog(self, d)
+
+    def open_search(self):
+        if getattr(self, 'search_win', None) and self.search_win.top.winfo_exists():
+            self.search_win.top.lift()
+            return
+        d = self._selected_source()
+        if not d:
+            messagebox.showinfo(APP, 'Choose a drive (or open a disk image) first.')
+            return
+        self.search_win = SearchDialog(self, d)
+
+    def open_chances(self):
+        d = self._selected_source()
+        if not d:
+            messagebox.showinfo(APP, 'Choose a drive (or open a disk image) first.')
+            return
+        ChancesDialog(self, d)
+
+    def _ssd_trim_warning(self, d):
+        """Before scanning an SSD with TRIM on: once per drive, offer the recoverability check."""
+        if not IS_WIN or d.get('image') or d.get('source_obj'):
+            return True
+        key = d.get('path')
+        warned = getattr(self, '_trim_warned', set())
+        self._trim_warned = warned
+        if key in warned:
+            return True
+        disks = sorted(d.get('disks') or ([d['number']] if d.get('number') is not None else []))
+        try:
+            dev = recoverability.device_info(disks)
+        except Exception:
+            return True
+        warned.add(key)
+        if dev.get('ssd') and dev.get('trim') and not dev.get('os_trim_off'):
+            ans = messagebox.askyesnocancel(
+                APP, 'This is an SSD with TRIM on. SSDs usually erase deleted files within minutes, so deleted '
+                     'files may already be gone.\n\nRun a quick recoverability check first (it takes seconds)?\n\n'
+                     'Yes = check first, No = scan anyway.', icon='warning')
+            if ans is None:
+                return False
+            if ans:
+                ChancesDialog(self, d)
+                return False
+        return True
 
     # ---------------------------------------------------------------- updates
     def start_update_check(self, force=False):
@@ -2271,11 +2368,12 @@ class RaidDialog:
 
     def _open(self, path, label, letters=()):
         try:
-            src = engine.RawSource(path, label)
-        except OSError as ex:
+            src = images.open_image(path, label) if os.path.isfile(path) else engine.RawSource(path, label)
+        except (OSError, ValueError) as ex:
             messagebox.showerror(APP, f'Could not open {label}:\n{ex}', parent=self.top)
             return
-        mp = rescue.find_map_for_image(path) if os.path.isfile(path) else None
+        mp = rescue.find_map_for_image(path) if os.path.isfile(path) and not isinstance(
+            src, images._ImageBase) else None
         if mp:
             try:
                 src.load_rescue_map(mp)
@@ -2293,7 +2391,7 @@ class RaidDialog:
 
     def add_images(self):
         ps = filedialog.askopenfilenames(parent=self.top, title='Member drive images (e.g. rescue images)',
-                                         filetypes=[('Disk images', '*.img *.dd *.raw *.bin *.001'), ('All', '*.*')])
+                                         filetypes=[('Disk images', images.IMAGE_PATTERNS), ('All', '*.*')])
         for p in ps:
             self._open(p, os.path.basename(p))
 
@@ -2464,6 +2562,388 @@ class RaidDialog:
     def close(self):
         self.cancel.set()
         self.top.destroy()
+
+
+class ChancesDialog:
+    """Recoverability check: are the deleted files likely to still be there?"""
+
+    COLORS = {'good': '#15803d', 'mixed': '#b45309', 'poor': '#b91c1c'}
+
+    def __init__(self, app, d):
+        self.app, self.d = app, d
+        self.cancel = threading.Event()
+        top = self.top = tk.Toplevel(app.root)
+        top.title(f'{APP} - recoverability check')
+        top.geometry('760x520')
+        set_window_icon(top)
+        frm = ttk.Frame(top, padding=12)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text=d.get('label') or d.get('path'), font=('Segoe UI', 10, 'bold') if IS_WIN
+                  else ('Helvetica', 10, 'bold')).pack(anchor='w')
+        ttk.Label(frm, foreground='#555', wraplength=720, text=(
+            'Looks at what kind of drive this is, checks whether a sample of its deleted files still has data, and '
+            'samples the unused space - a few seconds, about 500 small reads. On a failing drive, make a rescue '
+            'image first and check the image instead.')).pack(anchor='w', pady=(2, 8))
+        self.pbar = ttk.Progressbar(frm, mode='determinate', maximum=1000)
+        self.pbar.pack(fill='x')
+        self.head = tk.StringVar(value='Checking...')
+        self.lbl = ttk.Label(frm, textvariable=self.head, font=('Segoe UI', 12, 'bold') if IS_WIN
+                             else ('Helvetica', 12, 'bold'))
+        self.lbl.pack(anchor='w', pady=(10, 4))
+        self.txt = tk.Text(frm, height=14, wrap='word', relief='flat', background=top.cget('background'),
+                           font=('Segoe UI', 10) if IS_WIN else ('Helvetica', 10))
+        self.txt.pack(fill='both', expand=True)
+        b = ttk.Frame(frm)
+        b.pack(fill='x')
+        self.btn_scan = ttk.Button(b, text='Start scan', style='Big.TButton', state='disabled', command=self.scan)
+        self.btn_scan.pack(side='right')
+        ttk.Button(b, text='Close', command=self.close).pack(side='right', padx=6)
+        top.protocol('WM_DELETE_WINDOW', self.close)
+        threading.Thread(target=self.work, daemon=True).start()
+
+    def _ui(self, fn, *a):
+        self.app.q.put(('call', lambda: self.top.winfo_exists() and fn(*a)))
+
+    def work(self):
+        d = self.d
+        try:
+            src, own = self.app.open_source_for(d)
+        except Exception as ex:
+            self._ui(self.show, 'poor', 'Could not open the drive', str(ex))
+            return
+        try:
+            disks = sorted(d.get('disks') or ([d['number']] if d.get('number') is not None else []))
+            dev = recoverability.device_info(disks) if not d.get('image') and not d.get('source_obj') else {}
+            self._ui(self.head.set, 'Checking deleted files...')
+            dl = recoverability.sample_deleted(src, self.cancel)
+            self._ui(self.head.set, 'Sampling the free space...')
+            fs = recoverability.sample_free_space(src, lambda f: self._ui(self.pbar.__setitem__, 'value', 1000 * f),
+                                                  self.cancel)
+            if self.cancel.is_set():
+                return
+            level, head, text = recoverability.verdict(dev, fs, dl)
+            self._ui(self.show, level, head, text)
+        except Exception as ex:
+            self._ui(self.show, 'poor', 'The check failed', str(ex))
+        finally:
+            if own:
+                src.close()
+
+    def show(self, level, head, text):
+        self.pbar['value'] = 1000
+        self.head.set(head)
+        self.lbl.configure(foreground=self.COLORS.get(level, '#000'))
+        self.txt.configure(state='normal')
+        self.txt.delete('1.0', 'end')
+        self.txt.insert('1.0', text)
+        self.txt.configure(state='disabled')
+        self.btn_scan.configure(state='normal')
+
+    def scan(self):
+        self.top.destroy()
+        self.app._trim_warned = getattr(self.app, '_trim_warned', set()) | {self.d.get('path')}
+        self.app.start_scan()
+
+    def close(self):
+        self.cancel.set()
+        self.top.destroy()
+
+
+class UnlockDialog:
+    """Unlock a LUKS or VeraCrypt volume; the unlocked view is added to the drive list."""
+
+    def __init__(self, app, d):
+        self.app, self.d = app, d
+        top = self.top = tk.Toplevel(app.root)
+        top.title(f'{APP} - unlock encrypted drive')
+        top.geometry('720x470')
+        set_window_icon(top)
+        frm = ttk.Frame(top, padding=12)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text=d.get('label') or d.get('path'), font=('Segoe UI', 10, 'bold') if IS_WIN
+                  else ('Helvetica', 10, 'bold')).pack(anchor='w')
+        ttk.Label(frm, wraplength=680, foreground='#555', text=(
+            'Opens a LUKS (Linux, many NAS boxes) or VeraCrypt volume with its password, read-only. The unlocked '
+            'volume appears in the drive list and is scanned like any other drive. Nothing is written, and the '
+            'password is not stored. Supported: AES (the default in both); VeraCrypt with SHA-512 or SHA-256. '
+            'BitLocker is not supported - unlock it in Windows first, then scan the drive letter.')).pack(
+            anchor='w', pady=(2, 8))
+        try:
+            src, self.own = app.open_source_for(d)
+        except Exception as ex:
+            ttk.Label(frm, foreground='#b91c1c', text=f'Could not open it: {ex}').pack(anchor='w')
+            self.src = None
+            return
+        self.src = src
+        self.places = []                       # (label, offset, size, kind)
+        try:
+            for off, info in encrypted.find_luks(src):
+                self.places.append((f"LUKS{info['version']} volume at {human_size(off)} "
+                                    f"({info['cipher']}-{info['mode']})", off, None, 'luks'))
+        except Exception:
+            pass
+        self.places.append(('VeraCrypt: the whole drive / file', 0, src.size, 'vc'))
+        try:
+            for i, (off, size) in enumerate(engine._partition_table(src), 1):
+                self.places.append((f'VeraCrypt: partition {i} at {human_size(off)} ({human_size(size)})', off,
+                                    size, 'vc'))
+        except Exception:
+            pass
+        ttk.Label(frm, text='What to unlock:').pack(anchor='w')
+        self.v_place = tk.StringVar(value=self.places[0][0])
+        ttk.Combobox(frm, textvariable=self.v_place, values=[p[0] for p in self.places], state='readonly',
+                     width=80).pack(anchor='w', fill='x')
+        pf = ttk.Frame(frm)
+        pf.pack(fill='x', pady=(10, 0))
+        ttk.Label(pf, text='Password:').grid(row=0, column=0, sticky='w')
+        self.v_pw = tk.StringVar()
+        self.ent = ttk.Entry(pf, textvariable=self.v_pw, show='\u2022', width=40)
+        self.ent.grid(row=0, column=1, sticky='w', padx=6)
+        self.v_show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pf, text='Show', variable=self.v_show,
+                        command=lambda: self.ent.configure(show='' if self.v_show.get() else '\u2022')).grid(
+            row=0, column=2, sticky='w')
+        ttk.Label(pf, text='VeraCrypt PIM (blank = default):').grid(row=1, column=0, sticky='w', pady=(6, 0))
+        self.v_pim = tk.StringVar()
+        ttk.Entry(pf, textvariable=self.v_pim, width=10).grid(row=1, column=1, sticky='w', padx=6, pady=(6, 0))
+        self.v_hidden = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pf, text='Look for a hidden VeraCrypt volume first', variable=self.v_hidden).grid(
+            row=2, column=1, columnspan=2, sticky='w', pady=(6, 0))
+        self.msg = tk.StringVar()
+        ttk.Label(frm, textvariable=self.msg, wraplength=680).pack(anchor='w', pady=(10, 0))
+        b = ttk.Frame(frm)
+        b.pack(fill='x', side='bottom')
+        self.btn = ttk.Button(b, text='Unlock', style='Big.TButton', command=self.go)
+        self.btn.pack(side='right')
+        ttk.Button(b, text='Close', command=top.destroy).pack(side='right', padx=6)
+        self.ent.focus_set()
+        top.bind('<Return>', lambda e: self.go())
+
+    def go(self):
+        if self.src is None:
+            return
+        pw = self.v_pw.get()
+        if not pw:
+            self.msg.set('Type the password first.')
+            return
+        place = next(p for p in self.places if p[0] == self.v_place.get())
+        try:
+            pim = int(self.v_pim.get() or 0)
+        except ValueError:
+            self.msg.set('The PIM must be a number.')
+            return
+        self.btn.configure(state='disabled')
+        self.msg.set('Checking the password (this takes a few seconds - it is designed to be slow)...')
+        hidden = self.v_hidden.get()
+
+        def work():
+            try:
+                label = f"Unlocked: {self.d.get('label') or self.d.get('path')}"
+                if place[3] == 'luks':
+                    dec = encrypted.unlock_luks(self.src, pw, base=place[1], label=label + ' (LUKS)',
+                                                progress=lambda t: self.app.q.put(('call', self.msg.set, t)))
+                else:
+                    dec = encrypted.unlock_veracrypt(self.src, pw, base=place[1], size=place[2], pim=pim,
+                                                     hidden=hidden, label=label + ' (VeraCrypt)',
+                                                     progress=lambda t: self.app.q.put(('call', self.msg.set, t)))
+                self.app.q.put(('call', self.done, dec, None))
+            except Exception as ex:
+                self.app.q.put(('call', self.done, None, ex))
+        threading.Thread(target=work, daemon=True).start()
+
+    def done(self, dec, err):
+        if not self.top.winfo_exists():
+            return
+        self.btn.configure(state='normal')
+        if err:
+            self.msg.set(f'Not unlocked: {err}')
+            return
+        try:
+            v, kind = engine.open_volume(dec)
+        except Exception:
+            kind = 'unknown'
+        self.app.add_virtual(dec, self.d.get('letters', set()))
+        self.top.destroy()
+        messagebox.showinfo(APP, f'Unlocked ({dec.kind}). Inside: {kind}.\n\nIt is now selected in the drive list - '
+                                 'press Start scan.')
+
+
+class SearchDialog:
+    """Search inside the data for words or phrases."""
+
+    def __init__(self, app, d):
+        self.app, self.d = app, d
+        self.cancel = threading.Event()
+        self.hits = []
+        top = self.top = tk.Toplevel(app.root)
+        top.title(f'{APP} - search inside the data')
+        top.geometry('1040x640')
+        set_window_icon(top)
+        frm = ttk.Frame(top, padding=10)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text=d.get('label') or d.get('path'), font=('Segoe UI', 10, 'bold') if IS_WIN
+                  else ('Helvetica', 10, 'bold')).pack(anchor='w')
+        ttk.Label(frm, wraplength=1000, foreground='#555', text=(
+            'Finds words or phrases anywhere in the data - as plain text and as UTF-16 (how Windows and Office '
+            'store much of their text). Separate several with commas. Hits inside found files show the file; '
+            'hits in text nobody claims can be saved as a text file (text files have no signature, so this is '
+            'how lost notes, lists and CSVs come back).')).pack(anchor='w', pady=(2, 6))
+        f = ttk.Frame(frm)
+        f.pack(fill='x')
+        ttk.Label(f, text='Find:').pack(side='left')
+        self.v_terms = tk.StringVar()
+        e = ttk.Entry(f, textvariable=self.v_terms, width=50)
+        e.pack(side='left', padx=6)
+        e.focus_set()
+        self.v_scope = tk.StringVar(value='Whole drive')
+        ttk.Combobox(f, textvariable=self.v_scope, state='readonly', width=22,
+                     values=['Whole drive', 'Free space only', 'Inside found files']).pack(side='left', padx=6)
+        self.v_case = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text='Match case', variable=self.v_case).pack(side='left', padx=6)
+        self.btn = ttk.Button(f, text='Search', command=self.go)
+        self.btn.pack(side='left', padx=6)
+        ttk.Button(f, text='Stop', command=self.cancel.set).pack(side='left')
+        top.bind('<Return>', lambda ev: self.go())
+        cols = ('off', 'term', 'text', 'file')
+        tf = ttk.Frame(frm)
+        tf.pack(fill='both', expand=True, pady=6)
+        self.tree = ttk.Treeview(tf, columns=cols, show='headings', selectmode='browse')
+        for c, t, w in (('off', 'Position', 120), ('term', 'Found', 120), ('text', 'Text around it', 520),
+                        ('file', 'Inside file', 240)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor='w', stretch=(c == 'text'))
+        sb = ttk.Scrollbar(tf, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        sb.pack(side='left', fill='y')
+        self.tree.bind('<Double-1>', lambda ev: self.show_file())
+        b = ttk.Frame(frm)
+        b.pack(fill='x')
+        self.pbar = ttk.Progressbar(b, mode='determinate', maximum=1000, length=260)
+        self.pbar.pack(side='left')
+        self.msg = tk.StringVar()
+        ttk.Label(b, textvariable=self.msg).pack(side='left', padx=8)
+        ttk.Button(b, text='Save the text around it...', command=self.save_text).pack(side='right')
+        ttk.Button(b, text='Show the file', command=self.show_file).pack(side='right', padx=6)
+        top.protocol('WM_DELETE_WINDOW', self.close)
+
+    def close(self):
+        self.cancel.set()
+        self.top.destroy()
+
+    def go(self):
+        terms = [t.strip() for t in self.v_terms.get().split(',') if t.strip()]
+        if not terms:
+            return
+        self.cancel.clear()
+        self.hits = []
+        self.tree.delete(*self.tree.get_children())
+        scope = {'Whole drive': 'all', 'Free space only': 'free', 'Inside found files': 'files'}[self.v_scope.get()]
+        items = [self.app.items[i] for i in self.app.order]
+        if scope == 'files' and not items:
+            self.msg.set('Scan first - there are no found files yet.')
+            return
+        self.btn.configure(state='disabled')
+        self.msg.set('Searching...')
+        same = self.app.src is not None and self.d.get('path') and getattr(self.app.src, 'path', None) == (
+            self.d.get('source_obj').path if self.d.get('source_obj') else self.d.get('path'))
+        index = search.FileIndex(items) if same else None
+        case = self.v_case.get()
+
+        def work():
+            try:
+                src, own = self.app.open_source_for(self.d)
+            except Exception as ex:
+                self.app.q.put(('call', self.finished, f'Could not open the drive: {ex}'))
+                return
+            batch = []
+            n = 0
+            try:
+                for off, term, enc, ctx in search.search(
+                        src, terms, scope, items, case, progress=lambda f: self.app.q.put(
+                            ('call', self._progress, f)), cancel=self.cancel):
+                    it = index.at(off) if index else None
+                    batch.append((off, term, enc, ctx, it))
+                    n += 1
+                    if len(batch) >= 50:
+                        self.app.q.put(('call', self._add, batch))
+                        batch = []
+                if batch:
+                    self.app.q.put(('call', self._add, batch))
+                note = f'{n:,} hit(s)' + (' - stopped' if self.cancel.is_set() else '') + \
+                    (' (showing the first 5,000)' if n >= 5000 else '')
+            except Exception as ex:
+                note = f'Search failed: {ex}'
+            finally:
+                if own:
+                    src.close()
+            self.app.q.put(('call', self.finished, note))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _progress(self, f):
+        if self.top.winfo_exists():
+            self.pbar['value'] = 1000 * f
+
+    def _add(self, batch):
+        if not self.top.winfo_exists():
+            return
+        for off, term, enc, ctx, it in batch:
+            k = len(self.hits)
+            self.hits.append((off, term, enc, ctx, it))
+            self.tree.insert('', 'end', iid=str(k), values=(f'{off:,}', f'{term} ({enc})', ctx,
+                                                             f'{it.folder}/{it.name}' if it else '(not in a found file)'))
+
+    def finished(self, note):
+        if self.top.winfo_exists():
+            self.btn.configure(state='normal')
+            self.pbar['value'] = 1000
+            self.msg.set(note)
+
+    def _sel(self):
+        s = self.tree.selection()
+        return self.hits[int(s[0])] if s else None
+
+    def show_file(self):
+        h = self._sel()
+        if not h or not h[4]:
+            self.msg.set('That hit is not inside a found file - use "Save the text around it".')
+            return
+        it = h[4]
+        if self.app.tree.exists(str(it.id)):
+            self.app.tree.selection_set(str(it.id))
+            self.app.tree.see(str(it.id))
+            self.app.root.lift()
+        else:
+            self.msg.set('That file is hidden by the current filters in the main list.')
+
+    def save_text(self):
+        h = self._sel()
+        if not h:
+            return
+        off, term, enc, ctx, it = h
+        try:
+            src, own = self.app.open_source_for(self.d)
+            start, data = search.text_block(src, off, enc)
+            if own:
+                src.close()
+        except Exception as ex:
+            messagebox.showerror(APP, f'Could not read it: {ex}', parent=self.top)
+            return
+        if not data:
+            messagebox.showinfo(APP, 'No readable text around that hit.', parent=self.top)
+            return
+        path = filedialog.asksaveasfilename(parent=self.top, title='Save the text as',
+                                            initialfile=f'text_at_{start}.txt', defaultextension='.txt',
+                                            filetypes=[('Text', '*.txt'), ('All files', '*.*')])
+        if not path:
+            return
+        if self.app._same_drive(path):
+            messagebox.showwarning(APP, 'Save it to a different drive than the one being searched.', parent=self.top)
+            return
+        text = data.decode('utf-16-le' if enc == 'UTF-16' else 'utf-8', 'replace')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        self.msg.set(f'Saved {human_size(len(data))} of text to {path}')
 
 
 class PortableDialog:
@@ -2799,6 +3279,25 @@ def selftest(out_path):
         lines.append(f'icon bundled: {os.path.exists(resource_path("icon.ico"))}')
         src.close()
         code = 0 if ok and os.path.exists(resource_path('icon.ico')) else 2
+        # the libraries the encryption / compression support needs must be inside the build
+        try:
+            import zstandard
+            from argon2.low_level import hash_secret_raw, Type
+            import lzo
+            key = bytes(range(64))
+            cip = encrypted.SectorCipher('aes', 'xts-plain64', key)
+            blob = os.urandom(4096)
+            libs_ok = (cip.decrypt(cip.encrypt(blob, 7), 7) == blob and
+                       zstandard.ZstdDecompressor().decompressobj().decompress(
+                           zstandard.ZstdCompressor().compress(blob)) == blob and
+                       len(hash_secret_raw(b'pw', b'saltsaltsalt', time_cost=1, memory_cost=1024, parallelism=1,
+                                           hash_len=32, type=Type.ID)) == 32 and
+                       lzo.lzo1x_decompress(bytes([17 + 3]) + b'abc' + bytes([0x11, 0, 0])) == b'abc')
+        except Exception as ex:
+            libs_ok = f'no ({ex})'
+        lines.append(f'encryption / compression libraries work: {libs_ok}')
+        if libs_ok is not True:
+            code = 4
         if portable.is_portable():
             here = os.path.normcase(portable.app_dir())
             inside = all(os.path.normcase(os.path.abspath(p)).startswith(here) for p in
